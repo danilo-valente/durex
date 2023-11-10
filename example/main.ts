@@ -1,6 +1,9 @@
-import Workflow, { Cluster, StateKey, Store } from "../lib/server.ts";
+import KvStore from "../lib/kv-store.ts";
+import Workflow, { Cluster } from "../lib/server.ts";
 
 const kv = await Deno.openKv("./kv.sqlite3");
+
+const store = new KvStore(kv);
 
 const cluster = Cluster(import.meta.url);
 
@@ -12,23 +15,6 @@ try {
 }
 
 async function main(count: number) {
-  const store: Store = {
-    async save<T>([workflowId, script]: StateKey, state: T) {
-      await kv.set(["executions", workflowId, "activies", script], state);
-    },
-
-    async restore<T>([workflowId, script]: StateKey) {
-      const { value, versionstamp } = await kv.get<T>([
-        "executions",
-        workflowId,
-        "activies",
-        script,
-      ]);
-
-      return { exists: !!versionstamp, state: value };
-    },
-  };
-
   const workflow = Workflow(
     cluster,
     store,
