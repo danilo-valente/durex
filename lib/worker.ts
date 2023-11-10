@@ -2,6 +2,7 @@
 /// <reference lib="deno.worker" />
 /// <reference lib="webworker" />
 
+import { log } from "./log.ts";
 import { ParamsMessage, ResultMessage } from "./model.ts";
 
 export const main = <TInput, TOutput>(
@@ -12,7 +13,7 @@ export const main = <TInput, TOutput>(
 
   const listener = (e: MessageEvent<ParamsMessage<TInput>>) => {
     const { workflowId, input }: ParamsMessage<TInput> = e.data;
-    console.info(`[${script}]`, workflowId);
+    log(`[${script}]`, workflowId);
 
     const reply = (output: TOutput) =>
       postMessage(

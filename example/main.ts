@@ -1,11 +1,14 @@
 import KvStore from "../lib/kv-store.ts";
 import Workflow, { Cluster } from "../lib/server.ts";
+import { KvQueueChannel } from "../lib/signal.ts";
 
 const kv = await Deno.openKv("./kv.sqlite3");
 
 const store = new KvStore(kv);
 
 const cluster = Cluster(import.meta.url);
+
+const channel = new KvQueueChannel<{ x: number }>(kv);
 
 try {
   await main(parseInt(Deno.args[0]));
@@ -27,53 +30,26 @@ async function main(count: number) {
     },
   );
 
-  type QueueMessage = { workflowId: string; x: number };
+  channel.onSignal(async (workflowId, params) => {
+    const result = await workflow(workflowId, params.x);
 
-  const jobs = [];
-  const handlers = {};
-
-  const listener = kv.listenQueue(async (value) => {
-    const { workflowId, x } = value as QueueMessage;
-
-    const { resolve, reject } = handlers[workflowId] ?? {};
-    delete handlers[workflowId];
-
-    try {
-      const result = await workflow(workflowId, x);
-
-      console.info("[ -- ]", workflowId, "->", result);
-
-      if (resolve) {
-        resolve(result);
-      } else {
-        console.warn(`${workflowId}] Dangling workflow`);
-      }
-    } catch (e) {
-      if (reject) {
-        reject(e);
-      } else {
-        console.error(`[${workflowId}] Dangling error:`, e);
-      }
-    }
+    console.log("[ -- ]", workflowId, "->", result);
   });
+
+  channel.start();
 
   for (let x = 0; x < count; x++) {
     const workflowId = Math.random().toString(36).slice(2);
 
-    jobs.push(
-      new Promise((resolve, reject) => {
-        handlers[workflowId] = { resolve, reject };
-
-        kv.enqueue({ workflowId, x })
-          .then()
-          .catch(reject);
-      }),
-    );
+    channel.postSignal({
+      workflowId,
+      params: { x },
+    });
   }
 
   await new Promise<void>((resolve, reject) => {
     const watcher = setInterval(() => {
-      const remaining = Object.keys(handlers).length;
+      const remaining = channel.size;
 
       if (remaining === 0) {
         clearInterval(watcher);
@@ -83,8 +59,6 @@ async function main(count: number) {
       }
     }, 1000);
   });
-
-  await Promise.all(jobs);
 
   console.info("Closing workflows...");
   workflow.close();
@@ -96,5 +70,5 @@ async function main(count: number) {
   kv.close();
 
   console.info("Waiting for listener to finish...");
-  await listener;
+  await channel.result;
 }

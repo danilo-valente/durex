@@ -1,0 +1,1 @@
+export const log = Deno.env.get("DEBUG") ? console.log : () => {};  
