@@ -86,6 +86,8 @@ export class KvQueueChannel<TParams> implements Channel<TParams> {
 
         log("[ -- ]", workflowId, "->", result);
 
+        this.#workflows.delete(workflowId);
+
         if (resolve) {
           resolve(result);
         } else {

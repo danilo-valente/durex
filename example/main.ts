@@ -6,7 +6,10 @@ const kv = await Deno.openKv("./kv.sqlite3");
 
 const store = new KvStore(kv);
 
-const cluster = Cluster(import.meta.url);
+const cluster = Cluster({
+  base: import.meta.url,
+  shutdownTimeout: 1000,
+});
 
 const channel = new KvQueueChannel<{ x: number }>(kv);
 
@@ -66,7 +69,7 @@ async function main(count: number) {
   console.info("Closing cluster...");
   cluster.close();
 
-  console.info("Closing kv...");
+  console.info("Closing KV...");
   kv.close();
 
   console.info("Waiting for listener to finish...");

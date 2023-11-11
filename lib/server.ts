@@ -1,4 +1,4 @@
-import { ParamsMessage, ResultMessage } from "./model.ts";
+import Message, { OutputMessage } from "./model.ts";
 
 export type StateKey = [workflowId: string, script: string];
 
@@ -14,42 +14,58 @@ interface Activity<P, R> {
 
 type PromiseExecutor<T> = ConstructorParameters<typeof Promise<T>>[0];
 type PromiseHandlers<T> = Parameters<PromiseExecutor<T>>;
-type PromiseContext<T> = { resolve: PromiseHandlers<T>[0]; reject: PromiseHandlers<T>[1]; timeoutId: number };
+type PromiseContext<T> = {
+  resolve: PromiseHandlers<T>[0];
+  reject: PromiseHandlers<T>[1];
+  timeoutId: number;
+};
 
 type WorkerContext = {
   worker: Worker;
   invocations: Map<string, PromiseContext<TOutput>>;
-  close(): void;
+  close(signal?: Deno.Signal): void;
 };
 
-export const Cluster = (base: string | URL) => {
+export type ClusterConfig = {
+  base: string | URL;
+  shutdownTimeout: number;
+};
+
+export const Cluster = ({ base, shutdownTimeout }: ClusterConfig) => {
   const contexts = new Map<string, WorkerContext>();
 
   const initWorker = (store: Store, script: string) => {
-    const worker = new Worker(new URL(script, base).href, { type: 'module' });
+    const worker = new Worker(new URL(script, base).href, { type: "module" });
 
     const context: WorkerContext = {
       worker: worker,
       invocations: new Map(),
-      close() {
+      close(signal: Deno.Signal = "SIGINT") {
         for (const { reject, timeoutId } of this.invocations.values()) {
           clearTimeout(timeoutId);
-          reject(new Error('Worker terminated'));
+          reject(new Error("Worker terminated"));
         }
 
         this.invocations.clear();
 
-        worker.removeEventListener('message', listener);
-        worker.terminate();
+        worker.removeEventListener("message", listener);
+
+        worker.postMessage(Message.signal(signal));
+
+        // TODO: refactor
+        setTimeout(() => {
+          worker.terminate();
+        }, shutdownTimeout);
       },
     };
 
     contexts.set(script, context);
 
     const listener = async (e: MessageEvent) => {
-      const { workflowId, output }: ResultMessage<TOutput> = e.data;
+      const { workflowId, data: output }: OutputMessage<TOutput> = e.data;
 
-      const { resolve, reject, timeoutId } = context.invocations.get(workflowId) ?? {};
+      const { resolve, reject, timeoutId } =
+        context.invocations.get(workflowId) ?? {};
       context.invocations.delete(workflowId);
 
       try {
@@ -71,7 +87,7 @@ export const Cluster = (base: string | URL) => {
       }
     };
 
-    worker.addEventListener('message', listener);
+    worker.addEventListener("message", listener);
 
     return context;
   };
@@ -107,15 +123,19 @@ export const initActivity = <TInput, TOutput>(cluster: Cluster, store: Store, sc
     }
 
     return new Promise<TOutput>((resolve, reject) => {
+      // TODO: ensure worker caching before scheduling timer
       const timeoutId = setTimeout(() => {
         reject(`[${workflowId}] ${script} timed out after ${timeout}`);
       }, timeout);
 
       invocations.set(workflowId, { resolve, reject, timeoutId });
 
-      const message: ParamsMessage<TInput> = { workflowId, input };
+      // TODO: exchange messages using protobuf (https://pbkit.dev/) and/or gRPC
+      worker.postMessage(
+        Message.input(workflowId, input),
+      );
 
-      worker.postMessage(message);
+      // TODO: listen to signals and forward them to the workers
     });
   };
 
@@ -169,8 +189,13 @@ const Workflow = <TParams extends unknown[], TResult>(
 ): WorkflowMain<TParams, TResult> => {
   const shutdownHooks = new Set<() => void>();
 
-  const workflow: WorkflowMain<TParams, TResult> = (workflowId, ...params: TParams) => {
-    const activityFactory = <TInput, TOutput>(...config: Parameters<ActivityFactory<TParams>>) => {
+  const workflow: WorkflowMain<TParams, TResult> = (
+    workflowId,
+    ...params: TParams
+  ) => {
+    const activityFactory = <TInput, TOutput>(
+      ...config: Parameters<ActivityFactory<TParams>>
+    ) => {
       const activity = initActivity<TInput, TOutput>(cluster, store, ...config);
 
       const workspaceActivity = (input: TInput) => {
@@ -179,8 +204,9 @@ const Workflow = <TParams extends unknown[], TResult>(
         return activity(workflowId, input);
       };
 
-      workspaceActivity.followedBy = <TNextResult>(...config: Parameters<ActivityFactory<TParams>>) =>
-        activityFactory<TOutput, TNextResult>(...config);
+      workspaceActivity.followedBy = <TNextResult>(
+        ...config: Parameters<ActivityFactory<TParams>>
+      ) => activityFactory<TOutput, TNextResult>(...config);
 
       return workspaceActivity;
     };
@@ -188,8 +214,9 @@ const Workflow = <TParams extends unknown[], TResult>(
     // activityFactory.entry = <TParams, TOutput>(...config: Parameters<ActivityFactory>) =>
     //   activityFactory<TParams, TOutput>(...config);
 
-    activityFactory.entry = <TParams, TOutput>(...config: Parameters<ActivityFactory<TParams>>) =>
-      activityFactory<TParams, TOutput>(...config);
+    activityFactory.entry = <TParams, TOutput>(
+      ...config: Parameters<ActivityFactory<TParams>>
+    ) => activityFactory<TParams, TOutput>(...config);
 
     return executor(activityFactory, ...params);
   };
