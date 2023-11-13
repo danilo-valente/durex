@@ -1,13 +1,14 @@
+import { ulid } from "https://deno.land/x/ulid@v0.3.0/mod.ts";
 import { log } from "./log.ts";
 import { Mutex, Unknown } from "./util.ts";
 
 export type Signal<TParams> = {
-  readonly workflowId: string;
+  readonly executionId: string;
   readonly params: TParams;
 };
 
 export type SignalHandler<TParams> = (
-  workflowId: string,
+  executionId: string,
   params: TParams,
 ) => Unknown;
 
@@ -23,9 +24,9 @@ export interface Channel<TParams> {
    */
   close(): void;
 
-  postSignal(signal: Signal<TParams>): Promise<void>;
+  postSignal(params: TParams, executionId?: string): Promise<void>;
 
-  onSignal(handler: SignalHandler<TParams>): void;
+  onSignal(handler: SignalHandler<TParams>): () => void;
 
   // TODO: onError();
 }
@@ -47,7 +48,7 @@ const hasSignal = <TParams>(
 
 // TODO: extends MessagePort implements Channel
 export class KvQueueChannel<TParams> implements Channel<TParams> {
-  readonly #workflows = new Set<string>();
+  readonly #executions = new Set<string>();
 
   readonly #callbacks: Record<string, Handler<void>> = {};
 
@@ -73,39 +74,39 @@ export class KvQueueChannel<TParams> implements Channel<TParams> {
         await this.#mutex.signal;
       }
 
-      const { workflowId, params } = value[kSignal];
+      const { executionId, params } = value[kSignal];
 
-      const { resolve, reject } = this.#callbacks[workflowId] ?? {};
-      delete this.#callbacks[workflowId];
+      const { resolve, reject } = this.#callbacks[executionId] ?? {};
+      delete this.#callbacks[executionId];
 
       try {
-        const resultOrPromise = await this.#handler?.(workflowId, params);
+        const resultOrPromise = await this.#handler?.(executionId, params);
         const result = resultOrPromise instanceof Promise
           ? await resultOrPromise
           : resultOrPromise;
 
-        log("[ -- ]", workflowId, "->", result);
+        log("[ -- ]", executionId, "->", result);
 
-        this.#workflows.delete(workflowId);
+        this.#executions.delete(executionId);
 
         if (resolve) {
           resolve(result);
         } else {
-          console.warn(`${workflowId}] Dangling workflow`);
+          console.warn(`${executionId}] Dangling workflow`);
         }
       } catch (e) {
         // TODO: messageerror
         if (reject) {
           reject(e);
         } else {
-          console.error(`[${workflowId}] Dangling error:`, e);
+          console.error(`[${executionId}] Dangling error:`, e);
         }
       }
     });
   }
 
   get size() {
-    return this.#workflows.size;
+    return this.#executions.size;
   }
 
   start(): void {
@@ -120,24 +121,99 @@ export class KvQueueChannel<TParams> implements Channel<TParams> {
     }
   }
 
-  postSignal(signal: Signal<TParams>): Promise<void> {
+  postSignal(params: TParams, executionId: string = ulid()): Promise<void> {
+    const signal: Signal<TParams> = { executionId, params };
+
     return new Promise<void>((resolve, reject) => {
-      this.#workflows.add(signal.workflowId);
-      
-      this.#callbacks[signal.workflowId] = { resolve, reject };
+      this.#executions.add(signal.executionId);
+
+      this.#callbacks[signal.executionId] = { resolve, reject };
 
       const message: KvSignalMessage<TParams> = { [kSignal]: signal };
 
+      // console.log(Date.now() - params);
       this.#kv.enqueue(message)
-        .then()
-        .catch((...args) => {
-          this.#workflows.delete(signal.workflowId);
-          return reject(...args);
+        .then(() => {
+        })
+        .catch((err) => {
+          this.#executions.delete(signal.executionId);
+          return reject(err);
         });
     });
   }
 
-  onSignal(handler: SignalHandler<TParams>): void {
+  onSignal(handler: SignalHandler<TParams>): () => void {
     this.#handler = handler;
+
+    return () => {
+      if (this.#handler === handler) {
+        this.#handler = undefined;
+      }
+    };
+  }
+}
+
+export class InMemoryQueueChannel<TParams> implements Channel<TParams> {
+  readonly #mutex = new Mutex();
+
+  readonly result = Promise.resolve();
+
+  #size = 0;
+
+  #handler?: SignalHandler<TParams>;
+
+  constructor() {
+    this.#mutex.lock();
+  }
+
+  get size() {
+    return this.#size;
+  }
+
+  async #listener(value: unknown) {
+    if (!hasSignal<TParams>(value)) {
+      return;
+    }
+
+    if (this.#mutex.signal) {
+      await this.#mutex.signal;
+    }
+
+    const { executionId, params } = value[kSignal];
+
+    const resultOrPromise = await this.#handler?.(executionId, params);
+    const result = resultOrPromise instanceof Promise
+      ? await resultOrPromise
+      : resultOrPromise;
+
+    log("[ -- ]", executionId, "->", result);
+  }
+
+  start(): void {
+    this.#mutex.unlock();
+  }
+
+  close(): void {
+    this.#mutex.lock();
+  }
+
+  postSignal(params: TParams, executionId: string = ulid()): Promise<void> {
+    const signal: Signal<TParams> = { executionId, params };
+
+    const message: KvSignalMessage<TParams> = { [kSignal]: signal };
+
+    this.#size++;
+
+    return this.#listener(message);
+  }
+
+  onSignal(handler: SignalHandler<TParams>): () => void {
+    this.#handler = handler;
+
+    return () => {
+      if (this.#handler === handler) {
+        this.#handler = undefined;
+      }
+    };
   }
 }

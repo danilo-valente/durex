@@ -9,7 +9,7 @@ channel.onSignal((signal) => {
 });
 
 channel.postSignal({
-  workflowId: "1",
+  executionId: "1",
   params: {
     x: 1,
   },

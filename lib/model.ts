@@ -1,3 +1,18 @@
+export type StateId = {
+  workflowId: string;
+  executionId: string;
+  activityId: string;
+  invocationId: string;
+};
+
+export const CheckpointId = (stateId: StateId): string =>
+  [
+    stateId.workflowId,
+    stateId.executionId,
+    stateId.activityId,
+    stateId.invocationId,
+  ].join(":");
+
 export type MessageType = string;
 export type MessageData = unknown;
 
@@ -12,14 +27,25 @@ export type SignalMessage = Message<
   Deno.Signal
 >;
 
+export type ErrorMessage = Message<"error", {
+  message: string;
+  stack?: string;
+}>;
+
 export type WorkflowMessage<
   TType extends MessageType,
   TData extends MessageData,
-> = Message<TType, TData> & { workflowId: string };
+> = Message<TType, TData> & {
+  stateId: StateId;
+};
 
 export type InputMessage<TInput> = WorkflowMessage<"input", TInput>;
 export type OutputMessage<TOutput> = WorkflowMessage<"output", TOutput>;
-export type ErrorMessage = Message<"error", Error> & { workflowId?: string };
+
+export type ExceptionMessage = WorkflowMessage<"exception", {
+  message: string;
+  stack?: string;
+}>;
 
 export default {
   setup: <TData extends MessageData>(data: TData): SetupMessage<TData> => ({
@@ -32,24 +58,41 @@ export default {
     data: signal,
   }),
 
-  input: <TInput>(workflowId: string, input: TInput): InputMessage<TInput> => ({
+  error: (error: Error): ErrorMessage => ({
+    type: "error",
+    data: {
+      message: error.message,
+      stack: error.stack,
+    },
+  }),
+
+  input: <TInput>(
+    stateId: StateId,
+    input: TInput,
+  ): InputMessage<TInput> => ({
     type: "input",
-    workflowId,
+    stateId,
     data: input,
   }),
 
   output: <TOutput>(
-    workflowId: string,
+    stateId: StateId,
     output: TOutput,
   ): OutputMessage<TOutput> => ({
     type: "output",
-    workflowId,
+    stateId,
     data: output,
   }),
 
-  error: (error: Error, workflowId?: string): ErrorMessage => ({
-    type: "error",
-    workflowId,
-    data: error,
+  exception: (
+    stateId: StateId,
+    error: Error,
+  ): ExceptionMessage => ({
+    type: "exception",
+    stateId,
+    data: {
+      message: error.message,
+      stack: error.stack,
+    },
   }),
 };

@@ -1,15 +1,18 @@
-import Message, { OutputMessage } from "./model.ts";
+import Message, {
+  CheckpointId,
+  ExceptionMessage,
+  OutputMessage,
+  StateId,
+} from "./model.ts";
 
-export type StateKey = [workflowId: string, script: string];
+export type StateData<T> = {
+  exists: true;
+  state: T;
+} | { exists: false };
 
 export interface Store {
-  save<T>(key: StateKey, state: T): Promise<void>;
-  restore<T>(key: StateKey): Promise<{ exists: boolean; state: T }>;
-}
-
-interface Activity<P, R> {
-  (workflowId: string, params: P): Promise<R>;
-  close(): void;
+  save<T>(id: StateId, state: T): Promise<void>;
+  restore<T>(id: StateId): Promise<StateData<T>>;
 }
 
 type PromiseExecutor<T> = ConstructorParameters<typeof Promise<T>>[0];
@@ -17,12 +20,12 @@ type PromiseHandlers<T> = Parameters<PromiseExecutor<T>>;
 type PromiseContext<T> = {
   resolve: PromiseHandlers<T>[0];
   reject: PromiseHandlers<T>[1];
-  timeoutId: number;
+  signal?: AbortSignal;
 };
 
 type WorkerContext = {
   worker: Worker;
-  invocations: Map<string, PromiseContext<TOutput>>;
+  invocations: Map<string, PromiseContext<unknown>>;
   close(signal?: Deno.Signal): void;
 };
 
@@ -34,16 +37,35 @@ export type ClusterConfig = {
 export const Cluster = ({ base, shutdownTimeout }: ClusterConfig) => {
   const contexts = new Map<string, WorkerContext>();
 
-  const initWorker = (store: Store, script: string) => {
-    const worker = new Worker(new URL(script, base).href, { type: "module" });
+  const wrapWorker = (script: string) => {
+    const wrapperPath = "./worker/wrapper.ts";
+    const wrapperUrl = new URL(wrapperPath, import.meta.url);
+    wrapperUrl.searchParams.set("worker", new URL(script, base).href);
+
+    return new Worker(wrapperUrl, {
+      type: "module",
+      name: `wrapperPath?worker=${script}`,
+    });
+  };
+
+  const initContext = (store: Store, script: string, wrap: boolean) => {
+    const worker = wrap
+      ? wrapWorker(script)
+      : new Worker(new URL(script, base), {
+        type: "module",
+        name: script,
+      });
+
+    // TODO: send setup message
 
     const context: WorkerContext = {
       worker: worker,
       invocations: new Map(),
       close(signal: Deno.Signal = "SIGINT") {
-        for (const { reject, timeoutId } of this.invocations.values()) {
-          clearTimeout(timeoutId);
-          reject(new Error("Worker terminated"));
+        for (const { reject, signal } of this.invocations.values()) {
+          if (!signal?.aborted) {
+            reject(new Error("Worker terminated"));
+          }
         }
 
         this.invocations.clear();
@@ -52,7 +74,7 @@ export const Cluster = ({ base, shutdownTimeout }: ClusterConfig) => {
 
         worker.postMessage(Message.signal(signal));
 
-        // TODO: refactor
+        // TODO: clear timeout if worker self closes
         setTimeout(() => {
           worker.terminate();
         }, shutdownTimeout);
@@ -62,38 +84,55 @@ export const Cluster = ({ base, shutdownTimeout }: ClusterConfig) => {
     contexts.set(script, context);
 
     const listener = async (e: MessageEvent) => {
-      const { workflowId, data: output }: OutputMessage<TOutput> = e.data;
+      const { type, stateId, data }: OutputMessage<unknown> | ExceptionMessage =
+        e.data;
 
-      const { resolve, reject, timeoutId } =
-        context.invocations.get(workflowId) ?? {};
-      context.invocations.delete(workflowId);
+      const checkpointId = CheckpointId(stateId);
+
+      const { resolve, reject, signal } =
+        context.invocations.get(checkpointId) ??
+          {
+            resolve() {
+              console.warn(`[${checkpointId}] Dangling resolve`);
+            },
+            reject() {
+              console.error(`[${checkpointId}] Dangling reject`);
+            },
+          };
+
+      context.invocations.delete(checkpointId);
+
+      if (signal?.aborted) {
+        return;
+      }
+
+      if (type === "exception") {
+        const error = new Error(data.message, {
+          cause: data.stack,
+        });
+
+        reject(error);
+        return;
+      }
 
       try {
-        clearTimeout(timeoutId);
+        await store.save(stateId, data);
 
-        await store.save([workflowId, script], output);
-
-        if (resolve) {
-          resolve(output);
-        } else {
-          console.warn(`[${workflowId}] Dangling workflow`);
-        }
+        resolve(data);
       } catch (err) {
-        if (reject) {
-          reject(err);
-        } else {
-          console.error(`[${workflowId}] Dangling error:`, err);
-        }
+        reject(err);
       }
     };
 
     worker.addEventListener("message", listener);
+    // worker.addEventListener("messageerror", listener);
+    // worker.addEventListener("error", listener);
 
     return context;
   };
 
-  const getWorker = (store: Store, script: string) => {
-    return contexts.get(script) || initWorker(store, script);
+  const getContext = (store: Store, script: string, wrap: boolean) => {
+    return contexts.get(script) || initContext(store, script, wrap);
   };
 
   const close = () => {
@@ -103,131 +142,112 @@ export const Cluster = ({ base, shutdownTimeout }: ClusterConfig) => {
   };
 
   return {
-    getWorker,
+    getContext,
     close,
   };
 };
 
 export type Cluster = ReturnType<typeof Cluster>;
 
-export const initActivity = <TInput, TOutput>(cluster: Cluster, store: Store, script: string, timeout: number) => {
-  const { worker, invocations } = cluster.getWorker(store, script);
-
-  // TODO: handle errors
-
-  const invoke: Activity<TInput, TOutput> = async (workflowId, input) => {
-    const result = await store.restore<TOutput>([workflowId, script]);
-
-    if (result.exists) {
-      return result.state;
-    }
-
-    return new Promise<TOutput>((resolve, reject) => {
-      // TODO: ensure worker caching before scheduling timer
-      const timeoutId = setTimeout(() => {
-        reject(`[${workflowId}] ${script} timed out after ${timeout}`);
-      }, timeout);
-
-      invocations.set(workflowId, { resolve, reject, timeoutId });
-
-      // TODO: exchange messages using protobuf (https://pbkit.dev/) and/or gRPC
-      worker.postMessage(
-        Message.input(workflowId, input),
-      );
-
-      // TODO: listen to signals and forward them to the workers
-    });
-  };
-
-  invoke.close = () => {};
-
-  return invoke;
+export type Invocation<TOutput> = {
+  id: string;
+  controller: AbortController;
+  result: Promise<TOutput>;
 };
 
-// type WorkflowDeps<TP, TR> = Record<string, Activity<TP, TR>>;
+export type ActivityArgs = {
+  context: WorkerContext;
+  store: Store;
+  workflowId: string;
+  activityId: string;
+  timeout: number;
+};
 
-// type WorkflowSetup<TP, TR> = (
-//   Activity: <P extends TP, R extends TR>(script: string, timeout: number) => Activity<P, R>
-// ) => D;
+export type InvokeArgs<TInput> = {
+  executionId: string;
+  invocationId: string;
+  input: TInput;
+};
 
-// type WorkflowExecutor = <TP, TR, I>(args: I, activities: WorkflowDeps<TP, TR>) => Promise<void>;
+export class Activity<TInput, TOutput> {
+  readonly #context: WorkerContext;
+  readonly #store: Store;
+  readonly #workflowId: string;
+  readonly #activityId: string;
+  readonly #timeout: number;
 
-// export const Workflow = async <TP, TR, P extends TP, R extends TR>(
-//   store: Store,
-//   setup: WorkflowSetup<TP, TR>,
-//   executor: WorkflowExecutor,
-// ) => {
-//   const activities = setup(initActivity<P, R>.bind(null, store));
-
-//   return <I>(workflowId: string, ...args: I[]) => executor(args, activities);
-// };
-
-interface WorkspaceActivity<TInput, TOutput> {
-  (params: TInput): Promise<TOutput>;
-  followedBy<TNextResult>(...config: Parameters<ActivityFactory<unknown>>): WorkspaceActivity<TOutput, TNextResult>;
-}
-
-interface ActivityFactory<TParams> {
-  <TInput, TOutput>(script: string, timeout: number): WorkspaceActivity<TInput, TOutput>;
-  entry<TOutput>(...config: Parameters<ActivityFactory<TParams>>): WorkspaceActivity<TParams, TOutput>;
-}
-
-type WorkflowExecutor<TParams extends unknown[], TResult> = (
-  Activity: ActivityFactory<TParams>,
-  ...params: TParams
-) => Promise<TResult>;
-
-interface WorkflowMain<TParams extends unknown[], TResult> {
-  (workflowId: string, ...params: TParams): Promise<TResult>;
-  close(): void;
-}
-
-const Workflow = <TParams extends unknown[], TResult>(
-  cluster: Cluster,
-  store: Store,
-  executor: WorkflowExecutor<TParams, TResult>,
-): WorkflowMain<TParams, TResult> => {
-  const shutdownHooks = new Set<() => void>();
-
-  const workflow: WorkflowMain<TParams, TResult> = (
+  constructor({
+    context,
+    store,
     workflowId,
-    ...params: TParams
-  ) => {
-    const activityFactory = <TInput, TOutput>(
-      ...config: Parameters<ActivityFactory<TParams>>
-    ) => {
-      const activity = initActivity<TInput, TOutput>(cluster, store, ...config);
+    activityId,
+    timeout,
+  }: ActivityArgs) {
+    this.#context = context;
+    this.#store = store;
+    this.#workflowId = workflowId;
+    this.#activityId = activityId;
+    this.#timeout = timeout;
+  }
 
-      const workspaceActivity = (input: TInput) => {
-        shutdownHooks.add(activity.close);
-
-        return activity(workflowId, input);
-      };
-
-      workspaceActivity.followedBy = <TNextResult>(
-        ...config: Parameters<ActivityFactory<TParams>>
-      ) => activityFactory<TOutput, TNextResult>(...config);
-
-      return workspaceActivity;
+  invoke(
+    { executionId, invocationId, input }: InvokeArgs<TInput>,
+  ): Invocation<TOutput> {
+    const stateId: StateId = {
+      workflowId: this.#workflowId,
+      executionId,
+      activityId: this.#activityId,
+      invocationId,
     };
 
-    // activityFactory.entry = <TParams, TOutput>(...config: Parameters<ActivityFactory>) =>
-    //   activityFactory<TParams, TOutput>(...config);
+    const controller = new AbortController();
 
-    activityFactory.entry = <TParams, TOutput>(
-      ...config: Parameters<ActivityFactory<TParams>>
-    ) => activityFactory<TParams, TOutput>(...config);
+    const result = new Promise<TOutput>((resolve, reject) => {
+      const { worker, invocations } = this.#context;
 
-    return executor(activityFactory, ...params);
-  };
+      controller.signal.addEventListener("abort", reject);
 
-  workflow.close = () => {
-    for (const shutdownHook of shutdownHooks) {
-      shutdownHook();
-    }
-  };
+      this.#store.restore<TOutput>(stateId)
+        .then((storedState) => {
+          if (storedState.exists) {
+            return resolve(storedState.state);
+          }
 
-  return workflow;
-};
+          // TODO: ensure worker caching before scheduling timer
+          const timeoutId = setTimeout(() => {
+            controller.abort(
+              `[${stateId}] Timed out after ${this.#timeout}`,
+            );
+          }, this.#timeout);
 
-export default Workflow;
+          const checkpointId = CheckpointId(stateId);
+
+          invocations.set(checkpointId, {
+            resolve(result) {
+              clearTimeout(timeoutId);
+              resolve(result);
+            },
+            reject(reason) {
+              clearTimeout(timeoutId);
+              reject(reason);
+            },
+            signal: controller.signal,
+          });
+
+          // TODO: exchange messages using protobuf (https://pbkit.dev/) and/or gRPC
+          worker.postMessage(
+            Message.input(stateId, input),
+          );
+
+          // TODO: listen to signals and forward them to the workers
+        })
+        .catch(reject);
+    });
+
+    return {
+      id: invocationId,
+      controller,
+      result,
+    };
+  }
+}

@@ -1,6 +1,7 @@
 import KvStore from "../lib/kv-store.ts";
-import Workflow, { Cluster } from "../lib/server.ts";
+import { Cluster } from "../lib/server.ts";
 import { KvQueueChannel } from "../lib/signal.ts";
+import { ClusterWorkflow } from "../lib/workflow.ts";
 
 const kv = await Deno.openKv("./kv.sqlite3");
 
@@ -11,7 +12,7 @@ const cluster = Cluster({
   shutdownTimeout: 1000,
 });
 
-const channel = new KvQueueChannel<{ x: number }>(kv);
+const channel = new KvQueueChannel<number>(kv);
 
 try {
   await main(parseInt(Deno.args[0]));
@@ -21,33 +22,52 @@ try {
 }
 
 async function main(count: number) {
-  const workflow = Workflow(
+  const workflow = new ClusterWorkflow({
     cluster,
     store,
-    async (Activity, x: number) => {
-      const step1 = Activity.entry<number>("./a.ts", 1000);
-      const step2 = step1.followedBy<number>("./b.ts", 1000);
-      const step3 = step2.followedBy<string>("./c.ts", 1000);
+    workflowId: "example",
+    main: async (Activity, x: number) => {
+      const step1 = Activity<number, number>({
+        script: "./a.ts",
+        timeout: 100000,
+        wrap: true,
+      });
+      const step2 = Activity<number, number>({
+        script: "./b.ts",
+        timeout: 1000,
+        wrap: true,
+      });
+      const step3 = Activity<number, string>({
+        script: "./c.ts",
+        timeout: 1000,
+        wrap: true,
+      });
+
+      console.info(`Running workflow with params: ${x}`);
 
       return step1(x).then(step2).then(step3);
     },
-  );
+  });
 
-  channel.onSignal(async (workflowId, params) => {
-    const result = await workflow(workflowId, params.x);
-
-    console.log("[ -- ]", workflowId, "->", result);
+  let errorCount = 0;
+  let resultCount = 0;
+  
+  workflow.listen(channel, (executionId, x, err, result) => {
+    if (err) {
+      errorCount++;
+      console.error(`[${executionId}] Error: ${err}`);
+    } else {
+      resultCount++;
+      console.info(`[${executionId}] Result: ${result}`);
+    }
   });
 
   channel.start();
 
-  for (let x = 0; x < count; x++) {
-    const workflowId = Math.random().toString(36).slice(2);
+  for (let x = -1; x <= count; x++) {
+    const executionId = Math.random().toString(36).slice(2);
 
-    channel.postSignal({
-      workflowId,
-      params: { x },
-    });
+    channel.postSignal(x);
   }
 
   await new Promise<void>((resolve, reject) => {
@@ -74,4 +94,6 @@ async function main(count: number) {
 
   console.info("Waiting for listener to finish...");
   await channel.result;
+
+  console.info(`Done! ${errorCount} errors, ${resultCount} results.`);
 }

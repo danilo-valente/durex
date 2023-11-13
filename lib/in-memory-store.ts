@@ -1,16 +1,12 @@
 import { StateId } from "./model.ts";
 import { StateData, Store } from "./server.ts";
 
-class KvStore implements Store {
-  readonly #kv: Deno.Kv;
-
-  constructor(kv: Deno.Kv) {
-    this.#kv = kv;
-  }
+class InMemoryStore implements Store {
+  readonly map: Map<string, unknown> = new Map();
 
   private key(
     { workflowId, executionId, activityId, invocationId }: StateId,
-  ): string[] {
+  ): string {
     return [
       "workflows",
       workflowId,
@@ -20,18 +16,24 @@ class KvStore implements Store {
       activityId,
       "invocations",
       invocationId,
-    ];
+    ].join(":");
   }
 
   async save<T>(id: StateId, state: T) {
-    await this.#kv.set(this.key(id), state);
+    this.map.set(this.key(id), state);
   }
 
   async restore<T>(id: StateId): Promise<StateData<T>> {
-    const { value, versionstamp } = await this.#kv.get<T>(this.key(id));
+    const key = this.key(id);
+    if (!this.map.has(key)) {
+      return { exists: false };
+    }
 
-    return versionstamp ? { exists: true, state: value } : { exists: false };
+    return {
+      exists: true,
+      state: this.map.get(key) as T,
+    };
   }
 }
 
-export default KvStore;
+export default InMemoryStore;

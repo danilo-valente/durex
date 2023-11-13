@@ -1,6 +1,9 @@
 {
   "tasks": {
-    "start": "deno run -A --unstable ./example/main.ts 1000"
+    "clean": "rm -f kv.sqlite3 kv.sqlite3-shm kv.sqlite3-wal",
+    "start": "deno task clean && deno run -A --unstable",
+    "start:main": "deno task start ./example/main.ts 1000",
+    "start:ping": "deno task start ./example/ping.ts 1000"
   },
   "compilerOptions": {
     "lib": ["deno.ns", "deno.unstable"]

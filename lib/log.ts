@@ -1,1 +1,2 @@
-export const log = Deno.env.get("DEBUG") ? console.log : () => {};  
+const DEBUG = Number(Deno.env.get("DEBUG"));
+export const log = DEBUG ? console.log : () => {};  
