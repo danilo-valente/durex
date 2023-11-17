@@ -1,3 +1,4 @@
+import { timeEnd, timeStart } from "./log.ts";
 import Message, {
   CheckpointId,
   ExceptionMessage,
@@ -115,12 +116,17 @@ export const Cluster = ({ base, shutdownTimeout }: ClusterConfig) => {
         return;
       }
 
+      const timerTag = `[${stateId.activityId} -> ${stateId.executionId}]]`;
+      timeStart(timerTag);
+
       try {
         await store.save(stateId, data);
 
         resolve(data);
       } catch (err) {
         reject(err);
+      } finally {
+        timeEnd(timerTag);
       }
     };
 
@@ -207,6 +213,9 @@ export class Activity<TInput, TOutput> {
 
       controller.signal.addEventListener("abort", reject);
 
+      const timerTag = `[${stateId.activityId} -> ${stateId.executionId}]]`;
+      timeStart(timerTag);
+
       this.#store.restore<TOutput>(stateId)
         .then((storedState) => {
           if (storedState.exists) {
@@ -241,7 +250,10 @@ export class Activity<TInput, TOutput> {
 
           // TODO: listen to signals and forward them to the workers
         })
-        .catch(reject);
+        .catch(reject)
+        .finally(() => {
+          timeEnd(timerTag);
+        });
     });
 
     return {

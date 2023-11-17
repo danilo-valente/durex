@@ -1,5 +1,5 @@
 import { ulid } from "https://deno.land/x/ulid@v0.3.0/mod.ts";
-import { log } from "./log.ts";
+import { log, timeEnd, timeStart } from "./log.ts";
 import { Mutex, Unknown } from "./util.ts";
 
 export type Signal<TParams> = {
@@ -71,7 +71,12 @@ export class KvQueueChannel<TParams> implements Channel<TParams> {
       }
 
       if (this.#mutex.signal) {
+        const timerTag = `[${this.constructor.name}.#mutex.signal] ${value[kSignal].executionId}}`;
+        timeStart(timerTag);
+        
         await this.#mutex.signal;
+
+        timeEnd(timerTag);
       }
 
       const { executionId, params } = value[kSignal];
@@ -80,10 +85,15 @@ export class KvQueueChannel<TParams> implements Channel<TParams> {
       delete this.#callbacks[executionId];
 
       try {
-        const resultOrPromise = await this.#handler?.(executionId, params);
+        const timerTag = `[${this.constructor.name}.#listenQueue] ${executionId}`;
+        timeStart(timerTag);
+
+        const resultOrPromise = this.#handler?.(executionId, params);
         const result = resultOrPromise instanceof Promise
           ? await resultOrPromise
           : resultOrPromise;
+        
+        timeEnd(timerTag);
 
         log("[ -- ]", executionId, "->", result);
 
@@ -132,12 +142,18 @@ export class KvQueueChannel<TParams> implements Channel<TParams> {
       const message: KvSignalMessage<TParams> = { [kSignal]: signal };
 
       // console.log(Date.now() - params);
+      const timerTag = `[${this.constructor.name}.#postSignal] ${executionId}`;
+      timeStart(timerTag);
+  
       this.#kv.enqueue(message)
         .then(() => {
         })
         .catch((err) => {
           this.#executions.delete(signal.executionId);
           return reject(err);
+        })
+        .finally(() => {
+          timeEnd(timerTag);
         });
     });
   }
@@ -176,15 +192,25 @@ export class InMemoryQueueChannel<TParams> implements Channel<TParams> {
     }
 
     if (this.#mutex.signal) {
+      const timerTag = `[${this.constructor.name}.#mutex.signal] ${value[kSignal].executionId}}`;
+      timeStart(timerTag);
+
       await this.#mutex.signal;
+
+      timeEnd(timerTag);
     }
 
     const { executionId, params } = value[kSignal];
 
-    const resultOrPromise = await this.#handler?.(executionId, params);
+    const timerTag = `[${this.constructor.name}.#listener] ${executionId}`;
+    timeStart(timerTag);
+
+    const resultOrPromise = this.#handler?.(executionId, params);
     const result = resultOrPromise instanceof Promise
       ? await resultOrPromise
       : resultOrPromise;
+
+    timeEnd(timerTag);
 
     log("[ -- ]", executionId, "->", result);
   }
