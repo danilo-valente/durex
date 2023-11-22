@@ -45,7 +45,7 @@ export const Cluster = ({ base, shutdownTimeout }: ClusterConfig) => {
 
     return new Worker(wrapperUrl, {
       type: "module",
-      name: `wrapperPath?worker=${script}`,
+      name: `${wrapperPath}?worker=${script}`,
     });
   };
 
